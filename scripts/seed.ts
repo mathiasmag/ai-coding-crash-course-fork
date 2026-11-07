@@ -1938,27 +1938,33 @@ You've completed the Building REST APIs course. You now have the skills to build
     { name: "Zara Ahmed", course: course1, amountPaid: 2000, country: "PK", daysAgo: 87 },
   ];
 
-  for (const sale of salesActivity) {
-    const seedName = sale.name.split(" ")[0].toLowerCase();
-    const [buyer] = db
+  /** A new student who joined, and enrolled in `courseId`, `joinedDaysAgo` days ago. */
+  function createEnrolledStudent(
+    name: string,
+    courseId: number,
+    joinedDaysAgo: number
+  ) {
+    const [student] = db
       .insert(schema.users)
       .values({
-        name: sale.name,
-        email: `${sale.name.toLowerCase().replace(" ", ".")}@student.dev`,
+        name,
+        email: `${name.toLowerCase().replace(" ", ".")}@student.dev`,
         role: UserRole.Student,
-        avatarUrl: `https://api.dicebear.com/9.x/avataaars/svg?seed=${seedName}`,
-        createdAt: daysAgo(sale.daysAgo),
+        avatarUrl: `https://api.dicebear.com/9.x/avataaars/svg?seed=${name.split(" ")[0].toLowerCase()}`,
+        createdAt: daysAgo(joinedDaysAgo),
       })
       .returning()
       .all();
 
     db.insert(schema.enrollments)
-      .values({
-        userId: buyer.id,
-        courseId: sale.course.id,
-        enrolledAt: daysAgo(sale.daysAgo),
-      })
+      .values({ userId: student.id, courseId, enrolledAt: daysAgo(joinedDaysAgo) })
       .run();
+
+    return student;
+  }
+
+  for (const sale of salesActivity) {
+    const buyer = createEnrolledStudent(sale.name, sale.course.id, sale.daysAgo);
 
     db.insert(schema.purchases)
       .values({
@@ -1975,22 +1981,193 @@ You've completed the Building REST APIs course. You now have the skills to build
     `Created ${salesActivity.length} more buyers with purchases spread across the last 90 days.`
   );
 
+  // ─── Dashboard Learner Activity ───
+  // Learners who got in without buying, spread across 90 days: two more
+  // redeemed seats on the course 2 team purchase (one coupon stays available
+  // for trying /redeem), an older course 1 team purchase whose seats were
+  // redeemed 1–3 months ago, and a free course from Sarah with free enrollments.
+
+  const seatRedemptions = [
+    { name: "Priya Patel", coupon: seededCoupons[2], daysAgo: 18 },
+    { name: "Tom Becker", coupon: seededCoupons[3], daysAgo: 8 },
+  ];
+
+  for (const seat of seatRedemptions) {
+    const learner = createEnrolledStudent(seat.name, course2.id, seat.daysAgo);
+
+    db.update(schema.coupons)
+      .set({ redeemedByUserId: learner.id, redeemedAt: daysAgo(seat.daysAgo) })
+      .where(eq(schema.coupons.id, seat.coupon.id))
+      .run();
+  }
+
+  // A second team (an admin runs at most one team), bought before the 30-day
+  // window so its redeemed seats show up in the 90-day view.
+  const [teamLead] = db
+    .insert(schema.users)
+    .values({
+      name: "Grace Lee",
+      email: "grace.lee@student.dev",
+      role: UserRole.Student,
+      avatarUrl: "https://api.dicebear.com/9.x/avataaars/svg?seed=grace",
+      createdAt: daysAgo(82),
+    })
+    .returning()
+    .all();
+
+  const [team2] = db
+    .insert(schema.teams)
+    .values({ createdAt: daysAgo(80) })
+    .returning()
+    .all();
+
+  db.insert(schema.teamMembers)
+    .values({
+      teamId: team2.id,
+      userId: teamLead.id,
+      role: TeamMemberRole.Admin,
+      createdAt: daysAgo(80),
+    })
+    .run();
+
+  const [olderTeamPurchase] = db
+    .insert(schema.purchases)
+    .values({
+      userId: teamLead.id,
+      courseId: course1.id,
+      amountPaid: 4999 * 3,
+      country: "US",
+      createdAt: daysAgo(80),
+    })
+    .returning()
+    .all();
+
+  const olderTeamSeats = [
+    { name: "Ravi Iyer", daysAgo: 74 },
+    { name: "Elena Petrova", daysAgo: 52 },
+    { name: null, daysAgo: null }, // still available
+  ];
+
+  olderTeamSeats.forEach((seat, i) => {
+    const learner = seat.name
+      ? createEnrolledStudent(seat.name, course1.id, seat.daysAgo)
+      : null;
+    db.insert(schema.coupons)
+      .values({
+        teamId: team2.id,
+        courseId: course1.id,
+        code: `TEAM-TS-${String.fromCharCode(65 + i)}7Q2X9`,
+        purchaseId: olderTeamPurchase.id,
+        redeemedByUserId: learner?.id ?? null,
+        redeemedAt: seat.daysAgo === null ? null : daysAgo(seat.daysAgo),
+        createdAt: daysAgo(80),
+      })
+      .run();
+  });
+
+  const [freeCourse] = db
+    .insert(schema.courses)
+    .values({
+      title: "TypeScript Quick Tips",
+      slug: "typescript-quick-tips",
+      description:
+        "Short, free lessons on everyday TypeScript tricks you can use right away.",
+      salesCopy: `## Free TypeScript Tips
+
+Bite-sized lessons on the TypeScript features you'll reach for every day. No purchase needed — enroll and start learning.`,
+      instructorId: instructor1.id,
+      categoryId: catBySlug["programming"].id,
+      status: CourseStatus.Published,
+      coverImageUrl: "/images/course-typescript.svg",
+      price: 0,
+      createdAt: daysAgo(95),
+      updatedAt: daysAgo(95),
+    })
+    .returning()
+    .all();
+
+  const [freeModule] = db
+    .insert(schema.modules)
+    .values({
+      courseId: freeCourse.id,
+      title: "Everyday Tips",
+      position: 1,
+      createdAt: daysAgo(95),
+    })
+    .returning()
+    .all();
+
+  const freeLessons = [
+    {
+      title: "Narrowing with `in`",
+      content: `Use the \`in\` operator to narrow a union by checking which property an object has.`,
+      duration: 5,
+    },
+    {
+      title: "`satisfies` vs Type Annotations",
+      content: `\`satisfies\` checks a value against a type without widening it, so you keep the precise inferred type.`,
+      duration: 6,
+    },
+  ];
+
+  db.insert(schema.lessons)
+    .values(
+      freeLessons.map((lesson, i) => ({
+        moduleId: freeModule.id,
+        title: lesson.title,
+        content: lesson.content,
+        position: i + 1,
+        durationMinutes: lesson.duration,
+        createdAt: daysAgo(95),
+      }))
+    )
+    .run();
+
+  const freeEnrollments = [
+    { name: "Hana Yoshida", daysAgo: 1 },
+    { name: "Omar Haddad", daysAgo: 5 },
+    { name: "Chloe Martin", daysAgo: 13 },
+    { name: "Diego Ramos", daysAgo: 27 },
+    { name: "Freya Larsen", daysAgo: 41 },
+    { name: "Samuel Osei", daysAgo: 66 },
+    { name: "Lina Haddad", daysAgo: 84 },
+  ];
+
+  for (const enrollment of freeEnrollments) {
+    createEnrolledStudent(enrollment.name, freeCourse.id, enrollment.daysAgo);
+  }
+
+  console.log(
+    `Redeemed ${seatRedemptions.length} more team seats, added a second team purchase with ${olderTeamSeats.length} seats, and created free course "${freeCourse.title}" with ${freeEnrollments.length} free enrollments.`
+  );
+
+  const olderSeatsRedeemed = olderTeamSeats.filter((seat) => seat.name).length;
+  // Students who got exactly one enrollment from createEnrolledStudent.
+  const extraEnrolledStudents =
+    salesActivity.length +
+    seatRedemptions.length +
+    olderSeatsRedeemed +
+    freeEnrollments.length;
+  const extraStudents = extraEnrolledStudents + 1; // + Grace, the team lead
+
   console.log("\n✓ Seed complete!");
   console.log(
-    `  Users: ${9 + salesActivity.length} (1 admin, 2 instructors, ${6 + salesActivity.length} students)`
+    `  Users: ${9 + extraStudents} (1 admin, 2 instructors, ${6 + extraStudents} students)`
   );
   console.log("  Categories: 5");
   console.log(
-    `  Courses: 2 (${course1LessonIds.length} + ${course2LessonIds.length} lessons)`
+    `  Courses: 3 (${course1LessonIds.length} + ${course2LessonIds.length} + ${freeLessons.length} lessons)`
   );
   console.log("  Quizzes: 3");
-  console.log(`  Enrollments: ${7 + salesActivity.length}`);
+  console.log(`  Enrollments: ${7 + extraEnrolledStudents}`);
   console.log("  Course ratings: 6");
   console.log("  Lesson comments: 15 (4 questions awaiting an answer)");
   console.log(
-    `  Purchases: ${6 + salesActivity.length} (${5 + salesActivity.length} individual + 1 team)`
+    `  Purchases: ${7 + salesActivity.length} (${5 + salesActivity.length} individual + 2 team)`
   );
-  console.log("  Teams: 1 (with 5 coupons)");
+  console.log(
+    `  Teams: 2 (${5 + olderTeamSeats.length} coupons, ${2 + seatRedemptions.length + olderSeatsRedeemed} redeemed)`
+  );
 }
 
 seed().catch(console.error);

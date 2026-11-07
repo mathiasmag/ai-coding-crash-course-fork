@@ -83,6 +83,18 @@ function buy(
     .get();
 }
 
+function enroll(
+  courseId: number,
+  enrolledAt: string,
+  userId = createUser(schema.UserRole.Student).id
+) {
+  return testDb
+    .insert(schema.enrollments)
+    .values({ userId, courseId, enrolledAt })
+    .returning()
+    .get();
+}
+
 function viewOwn(range: DashboardRange = "30d") {
   return okDashboard(
     getInstructorDashboard({
@@ -239,6 +251,121 @@ describe("getInstructorDashboard", () => {
     });
   });
 
+  describe("learners", () => {
+    it("counts new learners in the window and total learners regardless of range", () => {
+      enroll(base.course.id, daysBeforeNow(5));
+      enroll(base.course.id, daysBeforeNow(45));
+      enroll(base.course.id, daysBeforeNow(400));
+
+      const dashboard = viewOwn("30d");
+
+      expect(dashboard.learners.new).toBe(1);
+      expect(dashboard.learners.total).toBe(3);
+      expect(dashboard.courses[0].learners).toEqual({ new: 1, total: 3 });
+    });
+
+    it("counts paid, free and redeemed team-seat enrollments alike", () => {
+      const paid = buy(base.course.id, 4999, daysBeforeNow(3));
+      enroll(base.course.id, daysBeforeNow(3), paid.userId);
+
+      const free = createCourse(base.instructor.id, "Free Course");
+      enroll(free.id, daysBeforeNow(2));
+
+      const teamPurchase = buy(base.course.id, 3 * 4999, daysBeforeNow(10));
+      const team = testDb.insert(schema.teams).values({}).returning().get();
+      const seatHolder = createUser(schema.UserRole.Student);
+      testDb
+        .insert(schema.coupons)
+        .values({
+          teamId: team.id,
+          courseId: base.course.id,
+          code: "TEAM-SEAT",
+          purchaseId: teamPurchase.id,
+          redeemedByUserId: seatHolder.id,
+          redeemedAt: daysBeforeNow(1),
+        })
+        .run();
+      enroll(base.course.id, daysBeforeNow(1), seatHolder.id);
+
+      const dashboard = viewOwn("30d");
+      const learnersByTitle = Object.fromEntries(
+        dashboard.courses.map((c) => [c.title, c.learners])
+      );
+
+      expect(learnersByTitle).toEqual({
+        "Test Course": { new: 2, total: 2 },
+        "Free Course": { new: 1, total: 1 },
+      });
+      expect(dashboard.learners.new).toBe(3);
+    });
+
+    it("rolls up per-course counts, so a learner in two courses counts twice", () => {
+      const second = createCourse(base.instructor.id, "Second", schema.CourseStatus.Archived);
+      const learner = createUser(schema.UserRole.Student);
+      enroll(base.course.id, daysBeforeNow(2), learner.id);
+      enroll(second.id, daysBeforeNow(40), learner.id);
+      enroll(second.id, daysBeforeNow(3));
+
+      const dashboard = viewOwn("30d");
+      const sum = (key: "new" | "total") =>
+        dashboard.courses.reduce((total, c) => total + c.learners[key], 0);
+
+      expect(dashboard.learners.new).toBe(2);
+      expect(dashboard.learners.total).toBe(3);
+      expect(dashboard.learners.new).toBe(sum("new"));
+      expect(dashboard.learners.total).toBe(sum("total"));
+    });
+
+    it.each([
+      ["7d", 7],
+      ["30d", 30],
+      ["90d", 90],
+    ] as const)(
+      "%s counts an enrollment just inside the window and not one just outside",
+      (range, days) => {
+        enroll(base.course.id, daysBeforeNow(days)); // exactly on the boundary
+        enroll(base.course.id, daysBeforeNow(0)); // exactly now
+        enroll(base.course.id, daysBeforeNow(days, -1)); // 1ms too early
+
+        expect(viewOwn(range).learners).toMatchObject({ new: 2, total: 3 });
+      }
+    );
+
+    it("all time counts every enrollment as new", () => {
+      enroll(base.course.id, daysBeforeNow(1));
+      enroll(base.course.id, daysBeforeNow(400));
+
+      expect(viewOwn("all").learners).toEqual({
+        new: 2,
+        total: 2,
+        comparison: null,
+      });
+    });
+
+    it("compares new learners with the previous window of the same length", () => {
+      enroll(base.course.id, daysBeforeNow(1));
+      enroll(base.course.id, daysBeforeNow(2));
+      enroll(base.course.id, daysBeforeNow(3));
+      enroll(base.course.id, daysBeforeNow(7, -1)); // previous, just after its end
+      enroll(base.course.id, daysBeforeNow(14)); // previous, on its start
+      enroll(base.course.id, daysBeforeNow(14, -1)); // before the previous window
+
+      expect(viewOwn("7d").learners.comparison).toEqual({
+        previous: 2,
+        changePercent: 50,
+      });
+    });
+
+    it("reports no percentage when the previous period had no new learners", () => {
+      enroll(base.course.id, daysBeforeNow(1));
+
+      expect(viewOwn("7d").learners.comparison).toEqual({
+        previous: 0,
+        changePercent: null,
+      });
+    });
+  });
+
   describe("window", () => {
     it.each([
       ["7d", 7],
@@ -319,6 +446,7 @@ describe("getInstructorDashboard", () => {
           title: "Test Course",
           slug: "test-course",
           status: schema.CourseStatus.Published,
+          learners: { new: 0, total: 0 },
           sales: 0,
         },
       ]);
@@ -328,11 +456,17 @@ describe("getInstructorDashboard", () => {
   describe("quiet periods", () => {
     it("reports zeros rather than nothing when the range has no activity", () => {
       buy(base.course.id, 5000, daysBeforeNow(200));
+      enroll(base.course.id, daysBeforeNow(200));
 
       const dashboard = viewOwn("7d");
 
       expect(dashboard.sales).toEqual({
         current: 0,
+        comparison: { previous: 0, changePercent: null },
+      });
+      expect(dashboard.learners).toEqual({
+        new: 0,
+        total: 1,
         comparison: { previous: 0, changePercent: null },
       });
       expect(dashboard.courses.map((c) => c.sales)).toEqual([0]);

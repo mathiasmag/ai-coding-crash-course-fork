@@ -1,7 +1,10 @@
 import { Form, Link, data, isRouteErrorResponse, useSubmit } from "react-router";
 import type { Route } from "./+types/instructor.dashboard";
 import { requireUserId } from "~/lib/access.server";
-import { getInstructorDashboard } from "~/services/analyticsService";
+import {
+  getInstructorDashboard,
+  type Comparison,
+} from "~/services/analyticsService";
 import { getUserById, getUsersByRole } from "~/services/userService";
 import { CourseStatus, UserRole } from "~/db/schema";
 import {
@@ -157,6 +160,22 @@ function formatChange(changePercent: number | null) {
   return `${rounded > 0 ? "+" : ""}${rounded}%`;
 }
 
+/** "+12% vs previous 30 days"; renders nothing for "all time". */
+function ComparisonNote({
+  comparison,
+  previousPeriod,
+}: {
+  comparison: Comparison | null;
+  previousPeriod: string | null;
+}) {
+  if (!comparison || !previousPeriod) return null;
+  return (
+    <p className="mt-1 text-sm text-muted-foreground">
+      {formatChange(comparison.changePercent)} vs previous {previousPeriod}
+    </p>
+  );
+}
+
 function statusLabel(status: CourseStatus) {
   return status === CourseStatus.Archived ? "Archived" : "Published";
 }
@@ -214,6 +233,28 @@ export default function InstructorDashboardPage({
             <Card>
               <CardHeader>
                 <CardTitle className="text-sm font-medium text-muted-foreground">
+                  Learners
+                </CardTitle>
+              </CardHeader>
+              <CardContent>
+                <div className="text-3xl font-bold">
+                  {dashboard.learners.new}
+                  <span className="ml-1 text-base font-normal text-muted-foreground">
+                    new
+                  </span>
+                </div>
+                <p className="mt-1 text-sm text-muted-foreground">
+                  {dashboard.learners.total} total
+                </p>
+                <ComparisonNote
+                  comparison={dashboard.learners.comparison}
+                  previousPeriod={previousPeriod}
+                />
+              </CardContent>
+            </Card>
+            <Card>
+              <CardHeader>
+                <CardTitle className="text-sm font-medium text-muted-foreground">
                   Sales
                 </CardTitle>
               </CardHeader>
@@ -221,12 +262,10 @@ export default function InstructorDashboardPage({
                 <div className="text-3xl font-bold">
                   {formatMoney(dashboard.sales.current)}
                 </div>
-                {dashboard.sales.comparison && previousPeriod && (
-                  <p className="mt-1 text-sm text-muted-foreground">
-                    {formatChange(dashboard.sales.comparison.changePercent)} vs
-                    previous {previousPeriod}
-                  </p>
-                )}
+                <ComparisonNote
+                  comparison={dashboard.sales.comparison}
+                  previousPeriod={previousPeriod}
+                />
               </CardContent>
             </Card>
           </div>
@@ -238,6 +277,12 @@ export default function InstructorDashboardPage({
                   <tr className="border-b text-left text-muted-foreground">
                     <th className="px-4 py-3 font-medium">Course</th>
                     <th className="px-4 py-3 font-medium">Status</th>
+                    <th className="px-4 py-3 text-right font-medium">
+                      New learners
+                    </th>
+                    <th className="px-4 py-3 text-right font-medium">
+                      Total learners
+                    </th>
                     <th className="px-4 py-3 text-right font-medium">Sales</th>
                   </tr>
                 </thead>
@@ -254,6 +299,12 @@ export default function InstructorDashboardPage({
                       </td>
                       <td className="px-4 py-3 text-muted-foreground">
                         {statusLabel(course.status)}
+                      </td>
+                      <td className="px-4 py-3 text-right tabular-nums">
+                        {course.learners.new}
+                      </td>
+                      <td className="px-4 py-3 text-right tabular-nums">
+                        {course.learners.total}
                       </td>
                       <td className="px-4 py-3 text-right tabular-nums">
                         {formatMoney(course.sales)}

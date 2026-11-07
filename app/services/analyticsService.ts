@@ -6,9 +6,16 @@
 // convention): the PRD fixes this signature, and four loosely-related inputs
 // read more clearly by name at the call site.
 
-import { and, eq, inArray, sql } from "drizzle-orm";
+import { and, count, eq, inArray, sql, type SQL } from "drizzle-orm";
+import type { SQLiteColumn } from "drizzle-orm/sqlite-core";
 import { db } from "~/db";
-import { courses, purchases, UserRole, CourseStatus } from "~/db/schema";
+import {
+  courses,
+  enrollments,
+  purchases,
+  UserRole,
+  CourseStatus,
+} from "~/db/schema";
 import { getUserById } from "./userService";
 import {
   DASHBOARD_RANGE_DAYS,
@@ -20,11 +27,19 @@ export type { DashboardRange };
 // Archived courses keep their history; drafts have none worth reporting.
 const INCLUDED_STATUSES = [CourseStatus.Published, CourseStatus.Archived];
 
+export type LearnerCounts = {
+  /** Enrollments in the current window. */
+  new: number;
+  /** All enrollments, ignoring the range. */
+  total: number;
+};
+
 export type DashboardCourseRow = {
   id: number;
   title: string;
   slug: string;
   status: CourseStatus;
+  learners: LearnerCounts;
   /** Cents actually paid in the current window. */
   sales: number;
 };
@@ -38,6 +53,10 @@ export type Comparison = {
 export type InstructorDashboard = {
   instructorId: number;
   range: DashboardRange;
+  learners: LearnerCounts & {
+    /** Compares new learners. Null for "all", which has no previous window. */
+    comparison: Comparison | null;
+  };
   sales: {
     /** Cents actually paid in the current window. */
     current: number;
@@ -84,14 +103,18 @@ function windowsFor(
 
 // Timestamps are stored as ISO-8601 UTC strings, so string comparison orders
 // them chronologically.
-function sumPaidWithin(window: Window) {
-  const at = purchases.createdAt;
+function within(at: SQLiteColumn, window: Window): SQL {
   const conditions = [
     window.endInclusive ? sql`${at} <= ${window.end}` : sql`${at} < ${window.end}`,
   ];
   if (window.start !== null) conditions.push(sql`${at} >= ${window.start}`);
-  const inWindow = sql.join(conditions, sql` and `);
-  return sql<number>`coalesce(sum(case when ${inWindow} then ${purchases.amountPaid} else 0 end), 0)`;
+  return sql.join(conditions, sql` and `);
+}
+
+/** Sums `value` over the joined rows whose `at` falls in the window; 0 if none. */
+function sumWithin(at: SQLiteColumn, value: SQL | SQLiteColumn, window: Window | null) {
+  if (window === null) return sql<number>`0`;
+  return sql<number>`coalesce(sum(case when ${within(at, window)} then ${value} else 0 end), 0)`;
 }
 
 function compare(current: number, previous: number): Comparison {
@@ -132,42 +155,82 @@ export function getInstructorDashboard(input: {
 
   const windows = windowsFor(range, now);
 
-  const rows = db
+  const isIncluded = and(
+    eq(courses.instructorId, targetId),
+    inArray(courses.status, INCLUDED_STATUSES)
+  );
+
+  // Two grouped queries rather than one: joining purchases and enrollments
+  // together would multiply each course's rows.
+  const salesRows = db
     .select({
       id: courses.id,
       title: courses.title,
       slug: courses.slug,
       status: courses.status,
-      sales: sumPaidWithin(windows.current),
-      previousSales: windows.previous
-        ? sumPaidWithin(windows.previous)
-        : sql<number>`0`,
+      sales: sumWithin(purchases.createdAt, purchases.amountPaid, windows.current),
+      previousSales: sumWithin(purchases.createdAt, purchases.amountPaid, windows.previous),
     })
     .from(courses)
     .leftJoin(purchases, eq(purchases.courseId, courses.id))
-    .where(
-      and(
-        eq(courses.instructorId, targetId),
-        inArray(courses.status, INCLUDED_STATUSES)
-      )
-    )
+    .where(isIncluded)
     .groupBy(courses.id)
     .all();
 
-  const sales = rows.reduce((total, row) => total + row.sales, 0);
-  const previousSales = rows.reduce((total, row) => total + row.previousSales, 0);
+  const countEach = sql`1`;
+  const learnerCounts = new Map(
+    db
+      .select({
+        id: courses.id,
+        new: sumWithin(enrollments.enrolledAt, countEach, windows.current),
+        previousNew: sumWithin(enrollments.enrolledAt, countEach, windows.previous),
+        total: count(enrollments.id),
+      })
+      .from(courses)
+      .leftJoin(enrollments, eq(enrollments.courseId, courses.id))
+      .where(isIncluded)
+      .groupBy(courses.id)
+      .all()
+      .map((row) => [row.id, row])
+  );
+
+  const courseTotals = salesRows.map(({ previousSales, ...course }) => {
+    const learners = learnerCounts.get(course.id);
+    return {
+      row: {
+        ...course,
+        learners: { new: learners?.new ?? 0, total: learners?.total ?? 0 },
+      },
+      previousSales,
+      previousNew: learners?.previousNew ?? 0,
+    };
+  });
+
+  const sumOf = (pick: (r: (typeof courseTotals)[number]) => number) =>
+    courseTotals.reduce((total, r) => total + pick(r), 0);
+  const sales = sumOf((r) => r.row.sales);
+  const newLearners = sumOf((r) => r.row.learners.new);
 
   return {
     outcome: "ok",
     dashboard: {
       instructorId: targetId,
       range,
+      learners: {
+        new: newLearners,
+        total: sumOf((r) => r.row.learners.total),
+        comparison: windows.previous
+          ? compare(newLearners, sumOf((r) => r.previousNew))
+          : null,
+      },
       sales: {
         current: sales,
-        comparison: windows.previous ? compare(sales, previousSales) : null,
+        comparison: windows.previous
+          ? compare(sales, sumOf((r) => r.previousSales))
+          : null,
       },
-      courses: rows
-        .map(({ previousSales: _, ...row }) => row)
+      courses: courseTotals
+        .map((r) => r.row)
         .sort((a, b) => b.sales - a.sales || a.title.localeCompare(b.title)),
     },
   };
