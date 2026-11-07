@@ -62,6 +62,12 @@ const navItems: NavItem[] = [
     roles: [UserRole.Student],
   },
   {
+    label: "Dashboard",
+    to: "/instructor/dashboard",
+    icon: <LayoutDashboard className="size-4" />,
+    roles: [UserRole.Instructor, UserRole.Admin],
+  },
+  {
     label: "My Courses",
     to: "/instructor",
     icon: <GraduationCap className="size-4" />,

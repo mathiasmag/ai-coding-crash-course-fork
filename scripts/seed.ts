@@ -1913,17 +1913,83 @@ You've completed the Building REST APIs course. You now have the skills to build
     `Created 1 team with Bossy McBossface as admin, 1 team purchase, and ${seededCoupons.length} coupons (2 redeemed, 3 available).`
   );
 
+  // ─── Dashboard Sales Activity ───
+  // More buyers spread across the last 90 days so the Instructor Dashboard has
+  // something to show in every range (7 / 30 / 90 days) and a previous period
+  // to compare against. Mix of full-price and PPP-discounted purchases, each
+  // with its matching enrollment.
+
+  const salesActivity: {
+    name: string;
+    course: typeof course1;
+    amountPaid: number;
+    country: string;
+    daysAgo: number;
+  }[] = [
+    { name: "Noah Kim", course: course1, amountPaid: 4999, country: "US", daysAgo: 2 },
+    { name: "Ava Singh", course: course2, amountPaid: 2400, country: "IN", daysAgo: 4 },
+    { name: "Lucas Silva", course: course1, amountPaid: 2000, country: "BR", daysAgo: 6 },
+    { name: "Mia Novak", course: course2, amountPaid: 5999, country: "DE", daysAgo: 11 },
+    { name: "Ethan Brooks", course: course1, amountPaid: 4999, country: "GB", daysAgo: 22 },
+    { name: "Isla Moreno", course: course1, amountPaid: 4999, country: "US", daysAgo: 58 },
+    { name: "Kenji Sato", course: course2, amountPaid: 5999, country: "JP", daysAgo: 64 },
+    { name: "Amara Okafor", course: course1, amountPaid: 1750, country: "NG", daysAgo: 71 },
+    { name: "Leo Fischer", course: course2, amountPaid: 5999, country: "AT", daysAgo: 79 },
+    { name: "Zara Ahmed", course: course1, amountPaid: 2000, country: "PK", daysAgo: 87 },
+  ];
+
+  for (const sale of salesActivity) {
+    const seedName = sale.name.split(" ")[0].toLowerCase();
+    const [buyer] = db
+      .insert(schema.users)
+      .values({
+        name: sale.name,
+        email: `${sale.name.toLowerCase().replace(" ", ".")}@student.dev`,
+        role: UserRole.Student,
+        avatarUrl: `https://api.dicebear.com/9.x/avataaars/svg?seed=${seedName}`,
+        createdAt: daysAgo(sale.daysAgo),
+      })
+      .returning()
+      .all();
+
+    db.insert(schema.enrollments)
+      .values({
+        userId: buyer.id,
+        courseId: sale.course.id,
+        enrolledAt: daysAgo(sale.daysAgo),
+      })
+      .run();
+
+    db.insert(schema.purchases)
+      .values({
+        userId: buyer.id,
+        courseId: sale.course.id,
+        amountPaid: sale.amountPaid,
+        country: sale.country,
+        createdAt: daysAgo(sale.daysAgo),
+      })
+      .run();
+  }
+
+  console.log(
+    `Created ${salesActivity.length} more buyers with purchases spread across the last 90 days.`
+  );
+
   console.log("\n✓ Seed complete!");
-  console.log("  Users: 9 (1 admin, 2 instructors, 6 students)");
+  console.log(
+    `  Users: ${9 + salesActivity.length} (1 admin, 2 instructors, ${6 + salesActivity.length} students)`
+  );
   console.log("  Categories: 5");
   console.log(
     `  Courses: 2 (${course1LessonIds.length} + ${course2LessonIds.length} lessons)`
   );
   console.log("  Quizzes: 3");
-  console.log("  Enrollments: 7");
+  console.log(`  Enrollments: ${7 + salesActivity.length}`);
   console.log("  Course ratings: 6");
   console.log("  Lesson comments: 15 (4 questions awaiting an answer)");
-  console.log("  Purchases: 6 (5 individual + 1 team)");
+  console.log(
+    `  Purchases: ${6 + salesActivity.length} (${5 + salesActivity.length} individual + 1 team)`
+  );
   console.log("  Teams: 1 (with 5 coupons)");
 }
 
