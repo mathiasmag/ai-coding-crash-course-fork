@@ -12,9 +12,13 @@ import { db } from "~/db";
 import {
   courses,
   enrollments,
+  lessonProgress,
+  lessons,
+  modules,
   purchases,
   UserRole,
   CourseStatus,
+  LessonProgressStatus,
 } from "~/db/schema";
 import { getUserById } from "./userService";
 import {
@@ -42,6 +46,19 @@ export type DashboardCourseRow = {
   learners: LearnerCounts;
   /** Cents actually paid in the current window. */
   sales: number;
+  /**
+   * Share (0–1) of the cohort that completed every lesson. Null when the
+   * course has no lessons or nobody enrolled in the window.
+   */
+  completionRate: number | null;
+};
+
+/** Completion across the cohort; see `cohortEnrollments`. */
+export type CompletionSummary = {
+  completed: number;
+  learners: number;
+  /** completed ÷ learners, weighted by enrollment. Null when no course has a rate. */
+  rate: number | null;
 };
 
 export type Comparison = {
@@ -63,6 +80,7 @@ export type InstructorDashboard = {
     /** Null for "all", which has no previous window. */
     comparison: Comparison | null;
   };
+  completion: CompletionSummary;
   courses: DashboardCourseRow[];
 };
 
@@ -115,6 +133,88 @@ function within(at: SQLiteColumn, window: Window): SQL {
 function sumWithin(at: SQLiteColumn, value: SQL | SQLiteColumn, window: Window | null) {
   if (window === null) return sql<number>`0`;
   return sql<number>`coalesce(sum(case when ${within(at, window)} then ${value} else 0 end), 0)`;
+}
+
+/**
+ * The learners Completion (and later Quiz scores) report on: enrollments in
+ * the included courses whose enrolledAt falls in the window — everyone for
+ * "all". One row per enrollment.
+ */
+function cohortEnrollments(isIncluded: SQL | undefined, window: Window) {
+  return db
+    .select({ userId: enrollments.userId, courseId: enrollments.courseId })
+    .from(enrollments)
+    .innerJoin(courses, eq(courses.id, enrollments.courseId))
+    .where(and(isIncluded, within(enrollments.enrolledAt, window)))
+    .as("cohort");
+}
+
+/**
+ * Per included course: cohort size, how many of them have completed every
+ * current lesson (from lesson_progress, not enrollments.completedAt), and the
+ * lesson count.
+ */
+function completionByCourse(isIncluded: SQL | undefined, window: Window) {
+  const cohort = cohortEnrollments(isIncluded, window);
+
+  const lessonCounts = db
+    .select({
+      courseId: modules.courseId,
+      lessons: count(lessons.id).as("lesson_count"),
+    })
+    .from(lessons)
+    .innerJoin(modules, eq(modules.id, lessons.moduleId))
+    .groupBy(modules.courseId)
+    .as("lesson_counts");
+
+  const completedLessons = db
+    .select({
+      userId: lessonProgress.userId,
+      courseId: modules.courseId,
+      completed: sql<number>`count(distinct ${lessonProgress.lessonId})`.as(
+        "completed_count"
+      ),
+    })
+    .from(lessonProgress)
+    .innerJoin(lessons, eq(lessons.id, lessonProgress.lessonId))
+    .innerJoin(modules, eq(modules.id, lessons.moduleId))
+    .where(eq(lessonProgress.status, LessonProgressStatus.Completed))
+    .groupBy(lessonProgress.userId, modules.courseId)
+    .as("completed_lessons");
+
+  return db
+    .select({
+      id: courses.id,
+      lessons: sql<number>`coalesce(max(${lessonCounts.lessons}), 0)`,
+      learners: count(cohort.userId),
+      completed: sql<number>`coalesce(sum(case when ${completedLessons.completed} = ${lessonCounts.lessons} then 1 else 0 end), 0)`,
+    })
+    .from(courses)
+    .leftJoin(cohort, eq(cohort.courseId, courses.id))
+    .leftJoin(lessonCounts, eq(lessonCounts.courseId, courses.id))
+    .leftJoin(
+      completedLessons,
+      and(
+        eq(completedLessons.userId, cohort.userId),
+        eq(completedLessons.courseId, courses.id)
+      )
+    )
+    .where(isIncluded)
+    .groupBy(courses.id)
+    .all();
+}
+
+type CourseCompletion = { lessons: number; learners: number; completed: number };
+
+const NO_COMPLETION: CourseCompletion = { lessons: 0, learners: 0, completed: 0 };
+
+function rateOf(completed: number, learners: number) {
+  return learners === 0 ? null : completed / learners;
+}
+
+/** Null when the course has no lessons or nobody in the cohort. */
+function completionRate(course: CourseCompletion) {
+  return course.lessons === 0 ? null : rateOf(course.completed, course.learners);
 }
 
 function compare(current: number, previous: number): Comparison {
@@ -194,15 +294,25 @@ export function getInstructorDashboard(input: {
       .map((row) => [row.id, row])
   );
 
+  const completionCounts = new Map(
+    completionByCourse(isIncluded, windows.current).map((row) => [row.id, row])
+  );
+
   const courseTotals = salesRows.map(({ previousSales, ...course }) => {
     const learners = learnerCounts.get(course.id);
+    const completion = completionCounts.get(course.id) ?? NO_COMPLETION;
+    const rate = completionRate(completion);
     return {
       row: {
         ...course,
         learners: { new: learners?.new ?? 0, total: learners?.total ?? 0 },
+        completionRate: rate,
       },
       previousSales,
       previousNew: learners?.previousNew ?? 0,
+      // Courses without a rate (no lessons, or nobody in the cohort) stay out
+      // of the weighted roll-up.
+      rolledUp: rate === null ? NO_COMPLETION : completion,
     };
   });
 
@@ -210,6 +320,8 @@ export function getInstructorDashboard(input: {
     courseTotals.reduce((total, r) => total + pick(r), 0);
   const sales = sumOf((r) => r.row.sales);
   const newLearners = sumOf((r) => r.row.learners.new);
+  const completedLearners = sumOf((r) => r.rolledUp.completed);
+  const cohortLearners = sumOf((r) => r.rolledUp.learners);
 
   return {
     outcome: "ok",
@@ -228,6 +340,11 @@ export function getInstructorDashboard(input: {
         comparison: windows.previous
           ? compare(sales, sumOf((r) => r.previousSales))
           : null,
+      },
+      completion: {
+        completed: completedLearners,
+        learners: cohortLearners,
+        rate: rateOf(completedLearners, cohortLearners),
       },
       courses: courseTotals
         .map((r) => r.row)

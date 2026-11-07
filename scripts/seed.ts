@@ -1938,6 +1938,10 @@ You've completed the Building REST APIs course. You now have the skills to build
     { name: "Zara Ahmed", course: course1, amountPaid: 2000, country: "PK", daysAgo: 87 },
   ];
 
+  // Students created below, by name, so their lesson progress can be added
+  // further down.
+  const dashboardStudentIds = new Map<string, number>();
+
   /** A new student who joined, and enrolled in `courseId`, `joinedDaysAgo` days ago. */
   function createEnrolledStudent(
     name: string,
@@ -1960,6 +1964,7 @@ You've completed the Building REST APIs course. You now have the skills to build
       .values({ userId: student.id, courseId, enrolledAt: daysAgo(joinedDaysAgo) })
       .run();
 
+    dashboardStudentIds.set(name, student.id);
     return student;
   }
 
@@ -2110,7 +2115,8 @@ Bite-sized lessons on the TypeScript features you'll reach for every day. No pur
     },
   ];
 
-  db.insert(schema.lessons)
+  const freeLessonIds = db
+    .insert(schema.lessons)
     .values(
       freeLessons.map((lesson, i) => ({
         moduleId: freeModule.id,
@@ -2121,7 +2127,9 @@ Bite-sized lessons on the TypeScript features you'll reach for every day. No pur
         createdAt: daysAgo(95),
       }))
     )
-    .run();
+    .returning({ id: schema.lessons.id })
+    .all()
+    .map((lesson) => lesson.id);
 
   const freeEnrollments = [
     { name: "Hana Yoshida", daysAgo: 1 },
@@ -2135,6 +2143,40 @@ Bite-sized lessons on the TypeScript features you'll reach for every day. No pur
 
   for (const enrollment of freeEnrollments) {
     createEnrolledStudent(enrollment.name, freeCourse.id, enrollment.daysAgo);
+  }
+
+  // ─── Dashboard Lesson Progress ───
+  // Recent learners at partial and full progress, so Completion has something
+  // to show in every range. Full = every current lesson completed.
+
+  const dashboardProgress = [
+    { name: "Omar Haddad", lessonIds: freeLessonIds, done: 2 },
+    { name: "Chloe Martin", lessonIds: freeLessonIds, done: 2 },
+    { name: "Hana Yoshida", lessonIds: freeLessonIds, done: 1 },
+    { name: "Diego Ramos", lessonIds: freeLessonIds, done: 1 },
+    { name: "Freya Larsen", lessonIds: freeLessonIds, done: 2 },
+    { name: "Lina Haddad", lessonIds: freeLessonIds, done: 2 },
+    { name: "Ethan Brooks", lessonIds: course1LessonIds, done: course1LessonIds.length },
+    { name: "Noah Kim", lessonIds: course1LessonIds, done: 4 },
+    { name: "Elena Petrova", lessonIds: course1LessonIds, done: course1LessonIds.length },
+    { name: "Ravi Iyer", lessonIds: course1LessonIds, done: 9 },
+    { name: "Mia Novak", lessonIds: course2LessonIds, done: course2LessonIds.length },
+    { name: "Priya Patel", lessonIds: course2LessonIds, done: 6 },
+    { name: "Ava Singh", lessonIds: course2LessonIds, done: 2 },
+  ];
+
+  for (const progress of dashboardProgress) {
+    const userId = dashboardStudentIds.get(progress.name);
+    if (userId === undefined) throw new Error(`No seeded student "${progress.name}"`);
+    // Stamped today so no completion predates its enrollment; the dashboard
+    // only looks at whether each lesson is completed, not when.
+    const completedDaysAgo = 0;
+    progress.lessonIds.slice(0, progress.done).forEach((lessonId) => {
+      markComplete(userId, lessonId, completedDaysAgo);
+    });
+    if (progress.done < progress.lessonIds.length) {
+      markInProgress(userId, progress.lessonIds[progress.done]);
+    }
   }
 
   console.log(

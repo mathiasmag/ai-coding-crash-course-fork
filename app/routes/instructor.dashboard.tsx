@@ -176,6 +176,17 @@ function ComparisonNote({
   );
 }
 
+/** Completion counts the learners who enrolled in the range, not everyone. */
+function cohortNote(range: DashboardRange) {
+  return range === "all"
+    ? "Completion covers all learners."
+    : `Completion covers learners who enrolled in the ${DASHBOARD_RANGE_LABELS[range].toLowerCase()}.`;
+}
+
+function formatRate(rate: number | null) {
+  return rate === null ? "—" : `${Math.round(rate * 100)}%`;
+}
+
 function statusLabel(status: CourseStatus) {
   return status === CourseStatus.Archived ? "Archived" : "Published";
 }
@@ -268,7 +279,27 @@ export default function InstructorDashboardPage({
                 />
               </CardContent>
             </Card>
+            <Card>
+              <CardHeader>
+                <CardTitle className="text-sm font-medium text-muted-foreground">
+                  Completion
+                </CardTitle>
+              </CardHeader>
+              <CardContent>
+                <div className="text-3xl font-bold">
+                  {formatRate(dashboard.completion.rate)}
+                </div>
+                <p className="mt-1 text-sm text-muted-foreground">
+                  {dashboard.completion.completed} of{" "}
+                  {dashboard.completion.learners} learners finished
+                </p>
+              </CardContent>
+            </Card>
           </div>
+
+          <p className="-mt-4 mb-6 text-xs text-muted-foreground">
+            {cohortNote(range)}
+          </p>
 
           <Card>
             <CardContent className="p-0">
@@ -284,6 +315,9 @@ export default function InstructorDashboardPage({
                       Total learners
                     </th>
                     <th className="px-4 py-3 text-right font-medium">Sales</th>
+                    <th className="px-4 py-3 text-right font-medium">
+                      Completion
+                    </th>
                   </tr>
                 </thead>
                 <tbody>
@@ -308,6 +342,9 @@ export default function InstructorDashboardPage({
                       </td>
                       <td className="px-4 py-3 text-right tabular-nums">
                         {formatMoney(course.sales)}
+                      </td>
+                      <td className="px-4 py-3 text-right tabular-nums">
+                        {formatRate(course.completionRate)}
                       </td>
                     </tr>
                   ))}

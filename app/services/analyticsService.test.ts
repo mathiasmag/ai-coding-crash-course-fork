@@ -86,13 +86,57 @@ function buy(
 function enroll(
   courseId: number,
   enrolledAt: string,
-  userId = createUser(schema.UserRole.Student).id
+  userId = createUser(schema.UserRole.Student).id,
+  completedAt: string | null = null
 ) {
   return testDb
     .insert(schema.enrollments)
-    .values({ userId, courseId, enrolledAt })
+    .values({ userId, courseId, enrolledAt, completedAt })
     .returning()
     .get();
+}
+
+/** Adds a module with `count` lessons to the course; returns the lesson ids. */
+function createLessons(courseId: number, count: number) {
+  const mod = testDb
+    .insert(schema.modules)
+    .values({ courseId, title: "Module", position: 1 })
+    .returning()
+    .get();
+  return Array.from({ length: count }, (_, i) =>
+    testDb
+      .insert(schema.lessons)
+      .values({ moduleId: mod.id, title: `Lesson ${i + 1}`, position: i + 1 })
+      .returning()
+      .get().id
+  );
+}
+
+function markLessons(
+  userId: number,
+  lessonIds: number[],
+  status = schema.LessonProgressStatus.Completed
+) {
+  for (const lessonId of lessonIds) {
+    testDb
+      .insert(schema.lessonProgress)
+      .values({
+        userId,
+        lessonId,
+        status,
+        completedAt:
+          status === schema.LessonProgressStatus.Completed
+            ? daysBeforeNow(1)
+            : null,
+      })
+      .run();
+  }
+}
+
+function completionRateOf(dashboard: ReturnType<typeof viewOwn>, title: string) {
+  const course = dashboard.courses.find((c) => c.title === title);
+  if (!course) throw new Error(`No row for "${title}"`);
+  return course.completionRate;
 }
 
 function viewOwn(range: DashboardRange = "30d") {
@@ -366,6 +410,107 @@ describe("getInstructorDashboard", () => {
     });
   });
 
+  describe("completion", () => {
+    it("is derived from lesson progress, not the stored enrollment completion date", () => {
+      const lessons = createLessons(base.course.id, 2);
+      const finished = enroll(base.course.id, daysBeforeNow(5)); // completedAt not set
+      markLessons(finished.userId, lessons);
+      // The stored completion date says complete; lesson progress disagrees.
+      const flagged = enroll(
+        base.course.id,
+        daysBeforeNow(5),
+        createUser(schema.UserRole.Student).id,
+        daysBeforeNow(1)
+      );
+      markLessons(flagged.userId, [lessons[0]]);
+
+      const dashboard = viewOwn("30d");
+
+      expect(completionRateOf(dashboard, "Test Course")).toBe(0.5);
+      expect(dashboard.completion).toEqual({
+        completed: 1,
+        learners: 2,
+        rate: 0.5,
+      });
+    });
+
+    it("does not count a learner who has completed only some lessons", () => {
+      const lessons = createLessons(base.course.id, 3);
+      const partial = enroll(base.course.id, daysBeforeNow(5));
+      markLessons(partial.userId, lessons.slice(0, 2));
+      markLessons(partial.userId, [lessons[2]], schema.LessonProgressStatus.InProgress);
+
+      expect(completionRateOf(viewOwn("30d"), "Test Course")).toBe(0);
+    });
+
+    it("ignores progress in other courses' lessons", () => {
+      createLessons(base.course.id, 1);
+      const other = createCourse(base.instructor.id, "Other");
+      const otherLessons = createLessons(other.id, 1);
+      const learner = enroll(base.course.id, daysBeforeNow(5));
+      markLessons(learner.userId, otherLessons);
+
+      expect(completionRateOf(viewOwn("30d"), "Test Course")).toBe(0);
+    });
+
+    it("is null for a course with no lessons or with no learners in the range", () => {
+      const noLessons = createCourse(base.instructor.id, "No lessons");
+      enroll(noLessons.id, daysBeforeNow(5));
+      const quiet = createCourse(base.instructor.id, "Quiet");
+      createLessons(quiet.id, 2);
+      enroll(quiet.id, daysBeforeNow(45));
+
+      const dashboard = viewOwn("30d");
+
+      expect(completionRateOf(dashboard, "No lessons")).toBeNull();
+      expect(completionRateOf(dashboard, "Quiet")).toBeNull();
+      expect(dashboard.completion.rate).toBeNull();
+    });
+
+    it("counts only learners who enrolled in the window, or everyone for all time", () => {
+      const lessons = createLessons(base.course.id, 1);
+      enroll(base.course.id, daysBeforeNow(30)); // on the boundary
+      const earlier = enroll(base.course.id, daysBeforeNow(30, -1)); // 1ms too early
+      markLessons(earlier.userId, lessons);
+
+      expect(viewOwn("30d").completion).toEqual({
+        completed: 0,
+        learners: 1,
+        rate: 0,
+      });
+      expect(viewOwn("all").completion).toEqual({
+        completed: 1,
+        learners: 2,
+        rate: 0.5,
+      });
+    });
+
+    it("rolls up weighted by enrollment, leaving out courses with no rate", () => {
+      const small = createCourse(base.instructor.id, "Small");
+      const smallLessons = createLessons(small.id, 1);
+      markLessons(enroll(small.id, daysBeforeNow(2)).userId, smallLessons);
+
+      const big = createCourse(base.instructor.id, "Big");
+      const bigLessons = createLessons(big.id, 1);
+      markLessons(enroll(big.id, daysBeforeNow(2)).userId, bigLessons);
+      enroll(big.id, daysBeforeNow(2));
+      enroll(big.id, daysBeforeNow(2));
+
+      enroll(base.course.id, daysBeforeNow(2)); // no lessons: no rate, not in the roll-up
+
+      const dashboard = viewOwn("30d");
+
+      expect(completionRateOf(dashboard, "Small")).toBe(1);
+      expect(completionRateOf(dashboard, "Big")).toBeCloseTo(1 / 3);
+      // 2 of 4, not the mean of the course rates (≈ 0.67)
+      expect(dashboard.completion).toEqual({
+        completed: 2,
+        learners: 4,
+        rate: 0.5,
+      });
+    });
+  });
+
   describe("window", () => {
     it.each([
       ["7d", 7],
@@ -448,6 +593,7 @@ describe("getInstructorDashboard", () => {
           status: schema.CourseStatus.Published,
           learners: { new: 0, total: 0 },
           sales: 0,
+          completionRate: null,
         },
       ]);
     });
