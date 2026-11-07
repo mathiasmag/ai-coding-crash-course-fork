@@ -133,10 +133,37 @@ function markLessons(
   }
 }
 
-function completionRateOf(dashboard: ReturnType<typeof viewOwn>, title: string) {
+/** A quiz on a new lesson in the course. */
+function createQuiz(courseId: number, passingScore = 0.7) {
+  const [lessonId] = createLessons(courseId, 1);
+  return testDb
+    .insert(schema.quizzes)
+    .values({ lessonId, title: "Quiz", passingScore })
+    .returning()
+    .get();
+}
+
+/** `passed` is stored as given, so tests can prove the service ignores it. */
+function recordAttempt(userId: number, quizId: number, score: number, passed = false) {
+  testDb
+    .insert(schema.quizAttempts)
+    .values({ userId, quizId, score, passed, attemptedAt: daysBeforeNow(1) })
+    .run();
+}
+
+function rowOf(dashboard: ReturnType<typeof viewOwn>, title: string) {
   const course = dashboard.courses.find((c) => c.title === title);
   if (!course) throw new Error(`No row for "${title}"`);
-  return course.completionRate;
+  return course;
+}
+
+function quizOf(dashboard: ReturnType<typeof viewOwn>, title: string) {
+  const course = rowOf(dashboard, title);
+  return { average: course.quizAverage, passRate: course.quizPassRate };
+}
+
+function completionRateOf(dashboard: ReturnType<typeof viewOwn>, title: string) {
+  return rowOf(dashboard, title).completionRate;
 }
 
 function viewOwn(range: DashboardRange = "30d") {
@@ -511,6 +538,103 @@ describe("getInstructorDashboard", () => {
     });
   });
 
+  describe("quiz scores", () => {
+    it("uses each learner's best attempt, not the latest or the mean", () => {
+      const quiz = createQuiz(base.course.id);
+      const learner = enroll(base.course.id, daysBeforeNow(5));
+      recordAttempt(learner.userId, quiz.id, 0.4);
+      recordAttempt(learner.userId, quiz.id, 0.9);
+      recordAttempt(learner.userId, quiz.id, 0.6); // latest
+
+      expect(quizOf(viewOwn("30d"), "Test Course")).toEqual({
+        average: 0.9,
+        passRate: 1,
+      });
+    });
+
+    it("averages best scores across learners and quizzes", () => {
+      const first = createQuiz(base.course.id);
+      const second = createQuiz(base.course.id);
+      const a = enroll(base.course.id, daysBeforeNow(5));
+      const b = enroll(base.course.id, daysBeforeNow(5));
+      recordAttempt(a.userId, first.id, 1);
+      recordAttempt(a.userId, second.id, 0.5);
+      recordAttempt(b.userId, first.id, 0.6);
+
+      const quiz = quizOf(viewOwn("30d"), "Test Course");
+
+      expect(quiz.average).toBeCloseTo(0.7);
+      expect(quiz.passRate).toBeCloseTo(1 / 3);
+    });
+
+    it("judges a pass against each quiz's own passing score, not the stored flag", () => {
+      const lenient = createQuiz(base.course.id, 0.6);
+      const strict = createQuiz(base.course.id, 0.8);
+      const learner = enroll(base.course.id, daysBeforeNow(5));
+      recordAttempt(learner.userId, lenient.id, 0.6, false); // meets 0.6 exactly
+      recordAttempt(learner.userId, strict.id, 0.7, true); // below 0.8
+
+      expect(quizOf(viewOwn("30d"), "Test Course").passRate).toBe(0.5);
+    });
+
+    it("is null for a course with no quizzes or no attempts from the learners counted", () => {
+      enroll(base.course.id, daysBeforeNow(5)); // no quizzes at all
+
+      const quiet = createCourse(base.instructor.id, "Quiet");
+      const quiz = createQuiz(quiet.id);
+      enroll(quiet.id, daysBeforeNow(5)); // counted, never attempted
+      const earlier = enroll(quiet.id, daysBeforeNow(45)); // attempted, not counted
+      recordAttempt(earlier.userId, quiz.id, 1);
+
+      const dashboard = viewOwn("30d");
+
+      expect(quizOf(dashboard, "Test Course")).toEqual({ average: null, passRate: null });
+      expect(quizOf(dashboard, "Quiet")).toEqual({ average: null, passRate: null });
+      expect(dashboard.quiz).toEqual({ bestAttempts: 0, average: null, passRate: null });
+    });
+
+    it("counts the same learners as Completion, or everyone for all time", () => {
+      const quiz = createQuiz(base.course.id);
+      recordAttempt(enroll(base.course.id, daysBeforeNow(30)).userId, quiz.id, 1); // on the boundary
+      recordAttempt(enroll(base.course.id, daysBeforeNow(30, -1)).userId, quiz.id, 0); // 1ms too early
+      recordAttempt(createUser(schema.UserRole.Student).id, quiz.id, 0); // never enrolled
+
+      expect(viewOwn("30d").quiz).toEqual({ bestAttempts: 1, average: 1, passRate: 1 });
+      expect(viewOwn("all").quiz).toEqual({ bestAttempts: 2, average: 0.5, passRate: 0.5 });
+    });
+
+    it("only counts quizzes in the course's own lessons", () => {
+      createQuiz(base.course.id);
+      const other = createCourse(base.instructor.id, "Other");
+      const otherQuiz = createQuiz(other.id);
+      const learner = enroll(base.course.id, daysBeforeNow(5)); // not enrolled in Other
+      recordAttempt(learner.userId, otherQuiz.id, 1);
+
+      const dashboard = viewOwn("30d");
+
+      expect(quizOf(dashboard, "Test Course").average).toBeNull();
+      expect(quizOf(dashboard, "Other").average).toBeNull();
+    });
+
+    it("rolls up by pooling best attempts across courses", () => {
+      const small = createCourse(base.instructor.id, "Small");
+      const smallQuiz = createQuiz(small.id);
+      recordAttempt(enroll(small.id, daysBeforeNow(2)).userId, smallQuiz.id, 1);
+
+      const bigQuiz = createQuiz(base.course.id);
+      for (let i = 0; i < 3; i++) {
+        recordAttempt(enroll(base.course.id, daysBeforeNow(2)).userId, bigQuiz.id, 0);
+      }
+
+      // 1 of 4 best attempts, not the mean of the course figures (0.5)
+      expect(viewOwn("30d").quiz).toEqual({
+        bestAttempts: 4,
+        average: 0.25,
+        passRate: 0.25,
+      });
+    });
+  });
+
   describe("window", () => {
     it.each([
       ["7d", 7],
@@ -594,6 +718,8 @@ describe("getInstructorDashboard", () => {
           learners: { new: 0, total: 0 },
           sales: 0,
           completionRate: null,
+          quizAverage: null,
+          quizPassRate: null,
         },
       ]);
     });

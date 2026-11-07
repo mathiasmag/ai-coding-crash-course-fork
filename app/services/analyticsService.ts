@@ -16,6 +16,8 @@ import {
   lessons,
   modules,
   purchases,
+  quizAttempts,
+  quizzes,
   UserRole,
   CourseStatus,
   LessonProgressStatus,
@@ -51,6 +53,13 @@ export type DashboardCourseRow = {
    * course has no lessons or nobody enrolled in the window.
    */
   completionRate: number | null;
+  /**
+   * Mean (0–1) of the cohort's best attempt per quiz. Null when the course has
+   * no quizzes or nobody in the cohort has attempted one.
+   */
+  quizAverage: number | null;
+  /** Share (0–1) of those best attempts meeting the quiz's passing score. */
+  quizPassRate: number | null;
 };
 
 /** Completion across the cohort; see `cohortEnrollments`. */
@@ -59,6 +68,13 @@ export type CompletionSummary = {
   learners: number;
   /** completed ÷ learners, weighted by enrollment. Null when no course has a rate. */
   rate: number | null;
+};
+
+/** Quiz scores across the cohort, pooling every (learner, quiz) best attempt. */
+export type QuizSummary = {
+  bestAttempts: number;
+  average: number | null;
+  passRate: number | null;
 };
 
 export type Comparison = {
@@ -81,6 +97,7 @@ export type InstructorDashboard = {
     comparison: Comparison | null;
   };
   completion: CompletionSummary;
+  quiz: QuizSummary;
   courses: DashboardCourseRow[];
 };
 
@@ -208,13 +225,73 @@ type CourseCompletion = { lessons: number; learners: number; completed: number }
 
 const NO_COMPLETION: CourseCompletion = { lessons: 0, learners: 0, completed: 0 };
 
-function rateOf(completed: number, learners: number) {
-  return learners === 0 ? null : completed / learners;
+/** part ÷ whole, or null when there is nothing to divide by. */
+function rateOf(part: number, whole: number) {
+  return whole === 0 ? null : part / whole;
 }
 
 /** Null when the course has no lessons or nobody in the cohort. */
 function completionRate(course: CourseCompletion) {
   return course.lessons === 0 ? null : rateOf(course.completed, course.learners);
+}
+
+type CourseQuizTotals = { bestAttempts: number; scoreSum: number; passed: number };
+
+const NO_QUIZ_ATTEMPTS: CourseQuizTotals = { bestAttempts: 0, scoreSum: 0, passed: 0 };
+
+/**
+ * Per included course, over the cohort's best attempt at each of the course's
+ * quizzes: how many there are, their score total, and how many meet that
+ * quiz's passing score. Courses with no such attempts are absent.
+ */
+function quizTotalsByCourse(isIncluded: SQL | undefined, window: Window) {
+  const cohort = cohortEnrollments(isIncluded, window);
+
+  const bestScores = db
+    .select({
+      userId: quizAttempts.userId,
+      courseId: sql<number>`${modules.courseId}`.as("quiz_course_id"),
+      passingScore: sql<number>`${quizzes.passingScore}`.as("passing_score"),
+      best: sql<number>`max(${quizAttempts.score})`.as("best_score"),
+    })
+    .from(quizAttempts)
+    .innerJoin(quizzes, eq(quizzes.id, quizAttempts.quizId))
+    .innerJoin(lessons, eq(lessons.id, quizzes.lessonId))
+    .innerJoin(modules, eq(modules.id, lessons.moduleId))
+    // A quiz has one course and passing score; grouping by them too keeps the
+    // query valid outside SQLite's bare-column leniency.
+    .groupBy(
+      quizAttempts.userId,
+      quizAttempts.quizId,
+      modules.courseId,
+      quizzes.passingScore
+    )
+    .as("best_scores");
+
+  return db
+    .select({
+      id: cohort.courseId,
+      bestAttempts: count(),
+      scoreSum: sql<number>`sum(${bestScores.best})`,
+      passed: sql<number>`sum(case when ${bestScores.best} >= ${bestScores.passingScore} then 1 else 0 end)`,
+    })
+    .from(cohort)
+    .innerJoin(
+      bestScores,
+      and(
+        eq(bestScores.userId, cohort.userId),
+        eq(bestScores.courseId, cohort.courseId)
+      )
+    )
+    .groupBy(cohort.courseId)
+    .all();
+}
+
+function quizFigures(totals: CourseQuizTotals) {
+  return {
+    average: rateOf(totals.scoreSum, totals.bestAttempts),
+    passRate: rateOf(totals.passed, totals.bestAttempts),
+  };
 }
 
 function compare(current: number, previous: number): Comparison {
@@ -298,16 +375,25 @@ export function getInstructorDashboard(input: {
     completionByCourse(isIncluded, windows.current).map((row) => [row.id, row])
   );
 
+  const quizTotals = new Map(
+    quizTotalsByCourse(isIncluded, windows.current).map((row) => [row.id, row])
+  );
+
   const courseTotals = salesRows.map(({ previousSales, ...course }) => {
     const learners = learnerCounts.get(course.id);
     const completion = completionCounts.get(course.id) ?? NO_COMPLETION;
     const rate = completionRate(completion);
+    const quiz = quizTotals.get(course.id) ?? NO_QUIZ_ATTEMPTS;
+    const { average, passRate } = quizFigures(quiz);
     return {
       row: {
         ...course,
         learners: { new: learners?.new ?? 0, total: learners?.total ?? 0 },
         completionRate: rate,
+        quizAverage: average,
+        quizPassRate: passRate,
       },
+      quiz,
       previousSales,
       previousNew: learners?.previousNew ?? 0,
       // Courses without a rate (no lessons, or nobody in the cohort) stay out
@@ -322,6 +408,11 @@ export function getInstructorDashboard(input: {
   const newLearners = sumOf((r) => r.row.learners.new);
   const completedLearners = sumOf((r) => r.rolledUp.completed);
   const cohortLearners = sumOf((r) => r.rolledUp.learners);
+  const pooledQuiz: CourseQuizTotals = {
+    bestAttempts: sumOf((r) => r.quiz.bestAttempts),
+    scoreSum: sumOf((r) => r.quiz.scoreSum),
+    passed: sumOf((r) => r.quiz.passed),
+  };
 
   return {
     outcome: "ok",
@@ -346,6 +437,7 @@ export function getInstructorDashboard(input: {
         learners: cohortLearners,
         rate: rateOf(completedLearners, cohortLearners),
       },
+      quiz: { bestAttempts: pooledQuiz.bestAttempts, ...quizFigures(pooledQuiz) },
       courses: courseTotals
         .map((r) => r.row)
         .sort((a, b) => b.sales - a.sales || a.title.localeCompare(b.title)),

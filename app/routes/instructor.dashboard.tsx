@@ -176,11 +176,11 @@ function ComparisonNote({
   );
 }
 
-/** Completion counts the learners who enrolled in the range, not everyone. */
+/** Completion and quiz scores count the learners who enrolled in the range, not everyone. */
 function cohortNote(range: DashboardRange) {
   return range === "all"
-    ? "Completion covers all learners."
-    : `Completion covers learners who enrolled in the ${DASHBOARD_RANGE_LABELS[range].toLowerCase()}.`;
+    ? "Completion and quiz scores cover all learners."
+    : `Completion and quiz scores cover learners who enrolled in the ${DASHBOARD_RANGE_LABELS[range].toLowerCase()}.`;
 }
 
 function formatRate(rate: number | null) {
@@ -295,6 +295,24 @@ export default function InstructorDashboardPage({
                 </p>
               </CardContent>
             </Card>
+            <Card>
+              <CardHeader>
+                <CardTitle className="text-sm font-medium text-muted-foreground">
+                  Quiz scores
+                </CardTitle>
+              </CardHeader>
+              <CardContent>
+                <div className="text-3xl font-bold">
+                  {formatRate(dashboard.quiz.average)}
+                  <span className="ml-1 text-base font-normal text-muted-foreground">
+                    avg
+                  </span>
+                </div>
+                <p className="mt-1 text-sm text-muted-foreground">
+                  {formatRate(dashboard.quiz.passRate)} pass rate
+                </p>
+              </CardContent>
+            </Card>
           </div>
 
           <p className="-mt-4 mb-6 text-xs text-muted-foreground">
@@ -317,6 +335,12 @@ export default function InstructorDashboardPage({
                     <th className="px-4 py-3 text-right font-medium">Sales</th>
                     <th className="px-4 py-3 text-right font-medium">
                       Completion
+                    </th>
+                    <th className="px-4 py-3 text-right font-medium">
+                      Quiz avg
+                    </th>
+                    <th className="px-4 py-3 text-right font-medium">
+                      Quiz pass rate
                     </th>
                   </tr>
                 </thead>
@@ -345,6 +369,12 @@ export default function InstructorDashboardPage({
                       </td>
                       <td className="px-4 py-3 text-right tabular-nums">
                         {formatRate(course.completionRate)}
+                      </td>
+                      <td className="px-4 py-3 text-right tabular-nums">
+                        {formatRate(course.quizAverage)}
+                      </td>
+                      <td className="px-4 py-3 text-right tabular-nums">
+                        {formatRate(course.quizPassRate)}
                       </td>
                     </tr>
                   ))}
